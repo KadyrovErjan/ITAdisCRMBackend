@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/avatars/
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.production
+.env.*.local
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AWS
+*.pem
+*.ppk
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
