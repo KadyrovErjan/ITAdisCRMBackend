@@ -14,6 +14,7 @@ from pathlib import Path
 import os
 from datetime import timedelta
 from dotenv import load_dotenv
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -24,19 +25,37 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-me-in-production')
+def env_bool(name, default=False):
+    return os.getenv(name, str(default)).strip().lower() in {'1', 'true', 'yes', 'on'}
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '*').split(',')
+def required_env(name):
+    value = os.getenv(name)
+    if not value:
+        raise ImproperlyConfigured(f'{name} environment variable must be set.')
+    return value
+
+
+# Production must always supply this through the environment.  There is no
+# fallback key, so an incorrectly configured production container fails fast.
+SECRET_KEY = required_env('SECRET_KEY')
+
+# The production .env explicitly sets this to False.  Defaulting to False
+# avoids accidentally serving a new environment with Django debug enabled.
+DEBUG = env_bool('DEBUG', False)
+
+ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if host.strip()]
 
 # Security settings for production
 if not DEBUG:
-    SECURE_SSL_REDIRECT = True
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
+    # TLS is terminated by Nginx, which is itself reached through Cloudflare.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = env_bool('SECURE_SSL_REDIRECT', True)
+    SESSION_COOKIE_SECURE = env_bool('SESSION_COOKIE_SECURE', True)
+    CSRF_COOKIE_SECURE = env_bool('CSRF_COOKIE_SECURE', True)
+    SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool('SECURE_HSTS_INCLUDE_SUBDOMAINS', True)
+    SECURE_HSTS_PRELOAD = env_bool('SECURE_HSTS_PRELOAD', False)
     SECURE_BROWSER_XSS_FILTER = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = 'DENY'
@@ -100,10 +119,10 @@ WSGI_APPLICATION = 'mysite.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME', 'itadis_db'),
-        'USER': os.getenv('DB_USER', 'itadis_user'),
-        'PASSWORD': os.getenv('DB_PASSWORD', 'itadis_password'),
-        'HOST': os.getenv('DB_HOST', 'localhost'),
+        'NAME': required_env('DB_NAME'),
+        'USER': required_env('DB_USER'),
+        'PASSWORD': required_env('DB_PASSWORD'),
+        'HOST': required_env('DB_HOST'),
         'PORT': os.getenv('DB_PORT', '5432'),
         'ATOMIC_REQUESTS': True,  # Автоматические транзакции для финансовых операций
         'CONN_MAX_AGE': 600,  # Connection pooling
@@ -169,7 +188,7 @@ LOCALE_PATHS = [
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
 
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 MEDIA_URL = '/media/'
@@ -193,11 +212,12 @@ MAILERS = {
 CORS_ALLOW_ALL_ORIGINS = DEBUG  # Только в dev режиме
 
 # Для production укажите конкретные домены frontend
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # React dev server
-    "http://localhost:5173",  # Vite dev server
-    "https://itadis.kg",  # Production frontend
-]
+# Если фронтенд на том же сервере, используйте IP-адрес
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://localhost:5173',
+).split(',') if origin.strip()]
+CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',') if origin.strip()]
 
 # Уруксат берилген HTTP методдор
 CORS_ALLOW_METHODS = [
@@ -291,8 +311,7 @@ SPECTACULAR_SETTINGS = {
     'COMPONENT_SPLIT_REQUEST': True,
     'SCHEMA_PATH_PREFIX': r'/api/v1',
     'SERVERS': [
-        {'url': 'http://localhost:8000', 'description': 'Development server'},
-        {'url': 'https://api.itadis.kg', 'description': 'Production server'},
+        {'url': os.getenv('API_BASE_URL', 'http://localhost:8000'), 'description': 'Server'},
     ],
     'TAGS': [
         {'name': 'auth', 'description': 'Аутентификация и авторизация'},

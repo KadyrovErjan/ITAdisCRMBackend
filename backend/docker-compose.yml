@@ -5,16 +5,16 @@ services:
     container_name: itadis_db
     restart: always
     environment:
-      POSTGRES_DB: ${DB_NAME:-itadis_db}
-      POSTGRES_USER: ${DB_USER:-itadis_user}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-itadis_password}
+      POSTGRES_DB: ${DB_NAME:?DB_NAME must be set in .env}
+      POSTGRES_USER: ${DB_USER:?DB_USER must be set in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - itadis_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-itadis_user}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:?DB_USER must be set in .env} -d ${DB_NAME:?DB_NAME must be set in .env}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -25,15 +25,17 @@ services:
     container_name: itadis_web
     restart: always
     command: >
-      sh -c "python manage.py collectstatic --noinput &&
-             python manage.py migrate &&
-             gunicorn mysite.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120 --access-logfile - --error-logfile -"
+      gunicorn mysite.wsgi:application --bind 0.0.0.0:8000 --workers 4
+      --timeout 120 --access-logfile - --error-logfile -
     volumes:
-      - static_volume:/app/staticfiles
-      - media_volume:/app/media
+      # Host mounts allow the host Nginx configuration to serve uploaded and
+      # collected files without exposing the Django container directly.
+      - ./staticfiles:/app/staticfiles
+      - ./media:/app/media
       - ./logs:/app/logs
     ports:
-      - "8000:8000"
+      # Public traffic must go through Nginx; only local Nginx can reach this.
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     depends_on:
@@ -41,13 +43,15 @@ services:
         condition: service_healthy
     networks:
       - itadis_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8000/healthz/ > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   postgres_data:
-    driver: local
-  static_volume:
-    driver: local
-  media_volume:
     driver: local
 
 networks:

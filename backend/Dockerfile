@@ -17,12 +17,12 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем requirements.txt
-COPY ../requirements.txt /app/
+# Копируем зависимости. Контекст сборки — папка backend, поэтому файл
+# должен копироваться из неё, а не из родительской директории.
+COPY requirements.txt /app/
 
 # Устанавливаем Python зависимости
 RUN pip install --upgrade pip && \
-    pip install gunicorn && \
     pip install -r requirements.txt
 
 # Копируем проект
@@ -39,7 +39,7 @@ EXPOSE 8000
 
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/admin/login/ || exit 1
+    CMD curl -f http://localhost:8000/healthz/ || exit 1
 
 # Команда по умолчанию
 CMD ["gunicorn", "mysite.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4", "--timeout", "120"]

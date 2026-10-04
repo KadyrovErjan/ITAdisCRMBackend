@@ -3,12 +3,19 @@ URL configuration for ITadis CRM project
 """
 from django.contrib import admin
 from django.urls import path, include
+from django.http import JsonResponse
 from django.conf import settings
 from django.conf.urls.static import static
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
 from itadis_app.views.auth import browser_logout_view
 
+
+def healthz(_request):
+    """Unauthenticated liveness endpoint for Nginx and deployments."""
+    return JsonResponse({'status': 'ok'})
+
 urlpatterns = [
+    path('healthz/', healthz, name='healthz'),
     # Django Admin
     path('admin/', admin.site.urls),
     path('logout/', browser_logout_view, name='browser-logout'),
