@@ -1,7 +1,8 @@
 name: Deploy backend to Hetzner
 
-# Kept manual until the owner explicitly enables automatic production deploys.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:

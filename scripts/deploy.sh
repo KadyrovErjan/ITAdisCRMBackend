@@ -64,6 +64,16 @@ failure_diagnostics() {
 }
 trap failure_diagnostics ERR
 
+gunicorn_health_check() {
+  local status_code
+  status_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 3 --max-time 5 \
+    --header 'Host: api.itadiscrm.com.kg' \
+    --header 'X-Forwarded-Proto: https' \
+    http://127.0.0.1:8000/healthz/ || true)"
+  [[ "$status_code" == '200' ]]
+}
+
 [[ -d "$REPOSITORY_DIR/.git" ]] || { echo "Missing Git checkout at $REPOSITORY_DIR; complete the documented initial clone first." >&2; exit 1; }
 install_prerequisites
 [[ -f "$APP_DIR/.env" ]] || { echo "Missing $APP_DIR/.env; deployment stopped." >&2; exit 1; }
@@ -84,7 +94,7 @@ docker compose run --rm web python manage.py collectstatic --noinput
 docker compose up -d --no-deps web
 
 for attempt in {1..15}; do
-  if curl --fail --silent --show-error http://127.0.0.1:8000/healthz/ > /dev/null; then
+  if gunicorn_health_check; then
     docker compose ps
     echo "Deployment succeeded."
     exit 0

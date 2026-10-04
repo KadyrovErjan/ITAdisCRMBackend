@@ -39,7 +39,7 @@ EXPOSE 8000
 
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/healthz/ || exit 1
+    CMD test "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --header 'Host: api.itadiscrm.com.kg' --header 'X-Forwarded-Proto: https' http://127.0.0.1:8000/healthz/)" = '200'
 
 # Команда по умолчанию
 CMD ["gunicorn", "mysite.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4", "--timeout", "120"]
