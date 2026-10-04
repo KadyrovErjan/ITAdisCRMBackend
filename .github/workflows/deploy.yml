@@ -23,5 +23,6 @@ jobs:
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           port: ${{ secrets.HETZNER_SSH_PORT || '22' }}
-          script_stop: true
-          script: /opt/itadiscrm/scripts/deploy.sh
+          command_timeout: 30m
+          script: |
+            exec bash -lc 'set -euo pipefail; exec /opt/itadiscrm/scripts/deploy.sh'
