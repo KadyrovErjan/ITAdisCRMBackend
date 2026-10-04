@@ -25,4 +25,4 @@ jobs:
           port: ${{ secrets.HETZNER_SSH_PORT || '22' }}
           command_timeout: 30m
           script: |
-            exec bash -lc 'set -euo pipefail; exec /opt/itadiscrm/scripts/deploy.sh'
+            exec bash -lc 'set -euo pipefail; exec bash /opt/itadiscrm/scripts/deploy.sh'
