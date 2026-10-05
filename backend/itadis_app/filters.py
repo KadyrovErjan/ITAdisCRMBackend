@@ -91,12 +91,17 @@ class StudentFilter(filters.FilterSet):
 class GroupFilter(filters.FilterSet):
     """Фильтр для групп"""
     search = filters.CharFilter(method='filter_search')
+    student_name = filters.CharFilter(method='filter_student_name')
     
     def filter_search(self, queryset, name, value):
         """Поиск по названию группы или предмету"""
         return queryset.filter(
             Q(name__icontains=value) | Q(subject__icontains=value)
         )
+
+    def filter_student_name(self, queryset, name, value):
+        """Возвращает группы, в которых есть ученик с указанным именем."""
+        return queryset.filter(students__full_name__icontains=value).distinct()
     
     class Meta:
         model = Group

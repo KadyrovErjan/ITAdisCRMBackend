@@ -117,6 +117,9 @@ class GroupViewSet(viewsets.ModelViewSet):
         """
         group = self.get_object()
         students = group.students.all().select_related('registered_by', 'group')
+        search = request.query_params.get('search', '').strip()
+        if search:
+            students = students.filter(full_name__icontains=search)
         serializer = StudentSerializer(students, many=True)
         # Возвращаем в формате пагинации для совместимости с frontend
         return Response({
