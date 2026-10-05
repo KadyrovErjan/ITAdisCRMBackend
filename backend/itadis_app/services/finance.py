@@ -3,27 +3,81 @@
 Согласно ТЗ раздел 7 - все операции атомарные с блокировками
 """
 from decimal import Decimal
-from django.db import transaction
-from django.core.exceptions import ValidationError
+from hashlib import sha256
+import json
+from django.db import IntegrityError, transaction
 from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import ValidationError as DRFValidationError
 import logging
 
-from ..models import User, Student, Group, Transaction, Balance, Collection, Expense
+from ..models import User, Student, Group, Transaction, Balance, Collection, Expense, IdempotencyKey
 from .audit import log_action
 
 logger = logging.getLogger(__name__)
+
+
+def _request_hash(payload: dict) -> str:
+    """Stable fingerprint used to reject a reused idempotency key with new data."""
+    normalized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return sha256(normalized.encode('utf-8')).hexdigest()
+
+
+def _reserve_idempotency_key(cashier, key, operation, payload):
+    """Returns an existing completed request or reserves a new key atomically."""
+    if not key:
+        return None, False
+
+    key = str(key).strip()
+    if not key or len(key) > 64:
+        raise DRFValidationError({'idempotency_key': _('Некорректный ключ идемпотентности')})
+
+    request_hash = _request_hash(payload)
+    try:
+        record = IdempotencyKey.objects.select_for_update().get(cashier=cashier, key=key)
+        if record.operation != operation or record.request_hash != request_hash:
+            raise DRFValidationError({
+                'idempotency_key': _('Этот ключ уже использован для другого запроса')
+            })
+        return record, True
+    except IdempotencyKey.DoesNotExist:
+        try:
+            # Savepoint keeps the surrounding financial transaction usable after a race.
+            with transaction.atomic():
+                record = IdempotencyKey.objects.create(
+                    cashier=cashier,
+                    key=key,
+                    operation=operation,
+                    request_hash=request_hash,
+                )
+            return record, False
+        except IntegrityError:
+            record = IdempotencyKey.objects.select_for_update().get(cashier=cashier, key=key)
+            if record.operation != operation or record.request_hash != request_hash:
+                raise DRFValidationError({
+                    'idempotency_key': _('Этот ключ уже использован для другого запроса')
+                })
+            return record, True
+
+
+def _increase_cashier_balance(cashier: User, amount: Decimal) -> None:
+    if not amount:
+        return
+    balance = Balance.objects.select_for_update().get(user=cashier)
+    balance.amount += amount
+    balance.save(update_fields=['amount', 'updated_at'])
 
 
 def register_student_payment(
     student_data: dict,
     group_id: str,
     amount: Decimal,
-    cashier: User
-) -> tuple[Student, Transaction]:
+    cashier: User,
+    booking_amount: Decimal = Decimal('0.00'),
+    idempotency_key: str | None = None,
+) -> tuple[Student, list[Transaction], bool]:
     """
     Регистрация нового ученика с первым платежом
-    Атомарно создаёт Student, Transaction(register) и увеличивает Balance кассира
+    Атомарно создаёт Student, Transaction(booking/register) и увеличивает Balance кассира.
     
     Args:
         student_data: dict с полями {'full_name': str}
@@ -32,19 +86,31 @@ def register_student_payment(
         cashier: пользователь-кассир
     
     Returns:
-        tuple (Student, Transaction)
+        tuple (Student, transactions, replayed)
     
     Raises:
         ValidationError: если данные некорректны
     """
-    if amount <= 0:
+    if amount < 0 or booking_amount < 0:
         raise DRFValidationError({
-            'amount': _('Сумма должна быть больше нуля'),
+            'amount': _('Сумма не может быть отрицательной'),
             'code': 'invalid_amount'
         })
 
     try:
         with transaction.atomic():
+            payload = {
+                'student_data': student_data,
+                'group_id': str(group_id),
+                'amount': str(amount),
+                'booking_amount': str(booking_amount),
+            }
+            idempotency_record, replayed = _reserve_idempotency_key(
+                cashier, idempotency_key, 'registration', payload
+            )
+            if replayed:
+                return idempotency_record.student, [], True
+
             # Получаем группу
             try:
                 group = Group.objects.select_for_update().get(id=group_id)
@@ -56,23 +122,27 @@ def register_student_payment(
             
             # Создаём ученика
             student = Student.objects.create(
-                full_name=student_data['full_name'],
+                **student_data,
                 group=group,
                 registered_by=cashier
             )
-            
-            # Создаём транзакцию регистрации
-            trans = Transaction.objects.create(
-                student=student,
-                cashier=cashier,
-                amount=amount,
-                type='register'
-            )
-            
-            # Увеличиваем баланс кассира
-            balance = Balance.objects.select_for_update().get(user=cashier)
-            balance.amount += amount
-            balance.save(update_fields=['amount', 'updated_at'])
+
+            transactions = []
+            if booking_amount:
+                transactions.append(Transaction.objects.create(
+                    student=student, cashier=cashier, amount=booking_amount, type='booking'
+                ))
+            if amount:
+                transactions.append(Transaction.objects.create(
+                    student=student, cashier=cashier, amount=amount, type='register'
+                ))
+
+            _increase_cashier_balance(cashier, booking_amount + amount)
+
+            if idempotency_record:
+                idempotency_record.student = student
+                idempotency_record.transaction = transactions[-1] if transactions else None
+                idempotency_record.save(update_fields=['student', 'transaction'])
             
             # Логируем действие
             log_action(
@@ -83,17 +153,26 @@ def register_student_payment(
                 payload={
                     'student_name': student.full_name,
                     'group_id': str(group_id),
-                    'amount': str(amount),
-                    'transaction_id': str(trans.id)
+                    'booking_amount': str(booking_amount),
+                    'first_payment_amount': str(amount),
+                    'transaction_ids': [str(item.id) for item in transactions],
                 }
             )
+            for trans in transactions:
+                log_action(
+                    user=cashier,
+                    action=f'transaction.{trans.type}',
+                    object_type='Transaction',
+                    object_id=trans.id,
+                    payload={'student_id': str(student.id), 'amount': str(trans.amount)},
+                )
             
             logger.info(
                 f"Student registered: {student.full_name} by {cashier.full_name}, "
-                f"amount: {amount}, transaction: {trans.id}"
+                f"booking: {booking_amount}, first payment: {amount}"
             )
             
-            return student, trans
+            return student, transactions, False
             
     except Exception as e:
         logger.error(f"Failed to register student: {e}")
@@ -111,14 +190,15 @@ def register_student_payment(
         raise
 
 
-def record_topup_payment(
+def record_student_payment(
     student_id: str,
     amount: Decimal,
-    cashier: User
-) -> Transaction:
+    cashier: User,
+    payment_type: str = 'topup',
+    idempotency_key: str | None = None,
+) -> tuple[Transaction, bool]:
     """
-    Запись доплаты от ученика
-    Атомарно создаёт Transaction(topup) и увеличивает Balance кассира
+    Атомарно записывает финансовое поступление и увеличивает Balance кассира.
     
     Args:
         student_id: UUID ученика
@@ -126,7 +206,7 @@ def record_topup_payment(
         cashier: пользователь-кассир
     
     Returns:
-        Transaction
+        tuple (Transaction, replayed)
     
     Raises:
         ValidationError: если данные некорректны
@@ -136,9 +216,22 @@ def record_topup_payment(
             'amount': _('Сумма должна быть больше нуля'),
             'code': 'invalid_amount'
         })
+    if payment_type not in {'booking', 'topup'}:
+        raise DRFValidationError({'type': _('Недопустимый тип платежа')})
     
     try:
         with transaction.atomic():
+            payload = {
+                'student_id': str(student_id),
+                'amount': str(amount),
+                'type': payment_type,
+            }
+            idempotency_record, replayed = _reserve_idempotency_key(
+                cashier, idempotency_key, 'payment', payload
+            )
+            if replayed:
+                return idempotency_record.transaction, True
+
             # Получаем ученика
             try:
                 student = Student.objects.select_for_update().get(id=student_id)
@@ -148,23 +241,24 @@ def record_topup_payment(
                     'code': 'student_not_found'
                 })
             
-            # Создаём транзакцию доплаты
+            # Создаём транзакцию платежа
             trans = Transaction.objects.create(
                 student=student,
                 cashier=cashier,
                 amount=amount,
-                type='topup'
+                type=payment_type,
             )
-            
-            # Увеличиваем баланс кассира
-            balance = Balance.objects.select_for_update().get(user=cashier)
-            balance.amount += amount
-            balance.save(update_fields=['amount', 'updated_at'])
+            _increase_cashier_balance(cashier, amount)
+
+            if idempotency_record:
+                idempotency_record.student = student
+                idempotency_record.transaction = trans
+                idempotency_record.save(update_fields=['student', 'transaction'])
             
             # Логируем действие
             log_action(
                 user=cashier,
-                action='transaction.topup',
+                action=f'transaction.{payment_type}',
                 object_type='Transaction',
                 object_id=trans.id,
                 payload={
@@ -175,17 +269,17 @@ def record_topup_payment(
             )
             
             logger.info(
-                f"Topup recorded: {student.full_name} paid {amount}, "
+                f"Payment recorded: {student.full_name} paid {amount}, "
                 f"cashier: {cashier.full_name}, transaction: {trans.id}"
             )
             
-            return trans
+            return trans, False
             
     except Exception as e:
         logger.error(f"Failed to record topup: {e}")
         log_action(
             user=cashier,
-            action='transaction.topup.failed',
+            action=f'transaction.{payment_type}.failed',
             object_type='Transaction',
             object_id=None,
             payload={
@@ -195,6 +289,22 @@ def record_topup_payment(
             }
         )
         raise
+
+
+def record_topup_payment(
+    student_id: str,
+    amount: Decimal,
+    cashier: User,
+    idempotency_key: str | None = None,
+) -> tuple[Transaction, bool]:
+    """Backward-compatible wrapper for an ordinary top-up payment."""
+    return record_student_payment(
+        student_id=student_id,
+        amount=amount,
+        cashier=cashier,
+        payment_type='topup',
+        idempotency_key=idempotency_key,
+    )
 
 
 def collect_money(

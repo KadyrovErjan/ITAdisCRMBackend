@@ -21,6 +21,20 @@ class IsCashier(permissions.BasePermission):
         return has_perm
 
 
+class IsCashierOrDirector(permissions.BasePermission):
+    """Кассир или директор: для разрешённых операций с учеником."""
+    message = _('Доступ только для кассира или директора')
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        has_perm = request.user.role in ['cashier', 'director']
+        if not has_perm:
+            log_permission_denied(request.user, view.action if hasattr(view, 'action') else 'unknown', view.__class__.__name__)
+        return has_perm
+
+
 class IsAccountant(permissions.BasePermission):
     """Доступ только для бухгалтеров"""
     message = _('Доступ только для бухгалтеров')

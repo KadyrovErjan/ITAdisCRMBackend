@@ -4,6 +4,7 @@ Serializers для ITadis CRM API
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.password_validation import validate_password
+from django.db.models import Sum
 from django.utils.translation import gettext_lazy as _
 from decimal import Decimal
 
@@ -339,29 +340,72 @@ class StudentSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(source='group.name', read_only=True)
     registered_by_name = serializers.CharField(source='registered_by.full_name', read_only=True)
     amount_paid_total = serializers.SerializerMethodField(read_only=True)
+    booking_total = serializers.SerializerMethodField(read_only=True)
+    remaining_balance = serializers.SerializerMethodField(read_only=True)
+    payment_status = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = Student
         fields = [
             'id', 'full_name', 'group', 'group_name',
             'registered_by', 'registered_by_name',
-            'status', 'created_at', 'amount_paid_total'
+            'phone', 'assistant_name', 'comment', 'contract_status', 'course_price',
+            'status', 'created_at', 'amount_paid_total', 'booking_total',
+            'remaining_balance', 'payment_status'
         ]
         read_only_fields = ['id', 'registered_by', 'created_at']
     
     def get_amount_paid_total(self, obj):
-        return str(obj.amount_paid_total)
+        total_paid = getattr(obj, 'total_paid', None)
+        return str(total_paid if total_paid is not None else obj.amount_paid_total)
+
+    def get_booking_total(self, obj):
+        booking_paid = getattr(obj, 'booking_paid', None)
+        if booking_paid is None:
+            booking_paid = obj.transactions.filter(type='booking').aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        return str(booking_paid)
+
+    def get_remaining_balance(self, obj):
+        remaining = getattr(obj, 'remaining_balance_annotated', None)
+        if remaining is None and obj.course_price is not None:
+            remaining = obj.remaining_balance
+        return str(remaining) if remaining is not None else None
+
+    def get_payment_status(self, obj):
+        remaining = getattr(obj, 'remaining_balance_annotated', None)
+        if remaining is None and obj.course_price is not None:
+            remaining = obj.remaining_balance
+        if remaining is None:
+            return 'unknown'
+        if remaining > 0:
+            return 'debt'
+        if remaining < 0:
+            return 'overpaid'
+        return 'paid'
 
 
 class StudentRegistrationSerializer(serializers.Serializer):
     """Serializer для регистрации нового ученика с первым платежом"""
     full_name = serializers.CharField(max_length=255)
     group = serializers.UUIDField()
-    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
+    phone = serializers.CharField(max_length=32, required=False, allow_blank=True, allow_null=True)
+    assistant_name = serializers.CharField(max_length=255, required=False, allow_blank=True, allow_null=True)
+    comment = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    contract_status = serializers.ChoiceField(
+        choices=['unknown', 'signed', 'not_signed'], required=False, default='unknown'
+    )
+    course_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.00'), required=False, allow_null=True
+    )
+    booking_amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.00'), required=False, default=Decimal('0.00')
+    )
+    # amount сохранён как backward-compatible имя первой оплаты.
+    amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.00'), required=False, default=Decimal('0.00')
+    )
     
     def validate_amount(self, value):
-        if value <= 0:
-            raise serializers.ValidationError(_('Сумма должна быть больше нуля'))
         return value
 
 
@@ -373,6 +417,18 @@ class StudentTopupSerializer(serializers.Serializer):
         if value <= 0:
             raise serializers.ValidationError(_('Сумма должна быть больше нуля'))
         return value
+
+
+class StudentDetailsUpdateSerializer(serializers.ModelSerializer):
+    """Разрешённые кассиру нефинансовые поля ученика."""
+
+    class Meta:
+        model = Student
+        fields = ['full_name', 'phone', 'assistant_name', 'comment', 'contract_status']
+
+
+class StudentStatusSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=['active', 'debt', 'frozen', 'expelled'])
 
 
 # ============= Transaction Serializers =============

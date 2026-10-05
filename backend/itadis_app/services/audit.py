@@ -3,8 +3,10 @@
 Согласно ТЗ п.5.8 и раздел 8-9
 """
 import logging
+import json
 from typing import Optional, Any
 from django.db import transaction
+from django.core.serializers.json import DjangoJSONEncoder
 
 from ..models import User, AuditLog
 
@@ -41,7 +43,9 @@ def log_action(
                 action=action,
                 object_type=object_type,
                 object_id=object_id,
-                payload=payload or {}
+                # JSONField does not consistently serialize Decimal/UUID across
+                # supported database backends. Normalise audit data before writing.
+                payload=json.loads(json.dumps(payload or {}, cls=DjangoJSONEncoder))
             )
             
             logger.debug(

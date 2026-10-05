@@ -72,12 +72,30 @@ class AuditLogFilter(filters.FilterSet):
 class StudentFilter(filters.FilterSet):
     """Фильтр для учеников"""
     search = filters.CharFilter(method='filter_search')
+    assistant = filters.CharFilter(field_name='assistant_name', lookup_expr='icontains')
+    contract_status = filters.CharFilter(field_name='contract_status')
+    payment_status = filters.CharFilter(method='filter_payment_status')
+    has_debt = filters.BooleanFilter(method='filter_has_debt')
     
     def filter_search(self, queryset, name, value):
         """Поиск по имени ученика"""
-        return queryset.filter(
-            Q(full_name__icontains=value)
-        )
+        return queryset.filter(Q(full_name__icontains=value) | Q(phone__icontains=value))
+
+    def filter_payment_status(self, queryset, name, value):
+        filters_by_status = {
+            'debt': Q(course_price__isnull=False, remaining_balance_annotated__gt=0),
+            'paid': Q(course_price__isnull=False, remaining_balance_annotated=0),
+            'overpaid': Q(course_price__isnull=False, remaining_balance_annotated__lt=0),
+            'unknown': Q(course_price__isnull=True),
+        }
+        condition = filters_by_status.get(value)
+        return queryset.filter(condition) if condition is not None else queryset
+
+    def filter_has_debt(self, queryset, name, value):
+        if value is None:
+            return queryset
+        condition = Q(course_price__isnull=False, remaining_balance_annotated__gt=0)
+        return queryset.filter(condition) if value else queryset.exclude(condition)
     
     class Meta:
         model = Student

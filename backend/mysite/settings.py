@@ -116,18 +116,28 @@ WSGI_APPLICATION = 'mysite.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': required_env('DB_NAME'),
-        'USER': required_env('DB_USER'),
-        'PASSWORD': required_env('DB_PASSWORD'),
-        'HOST': required_env('DB_HOST'),
-        'PORT': os.getenv('DB_PORT', '5432'),
-        'ATOMIC_REQUESTS': True,  # Автоматические транзакции для финансовых операций
-        'CONN_MAX_AGE': 600,  # Connection pooling
+if env_bool('ITADIS_TEST_SQLITE'):
+    # Explicit opt-in local test database. Production continues to require PostgreSQL.
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': os.getenv('ITADIS_TEST_SQLITE_PATH', str(BASE_DIR / 'test.sqlite3')),
+            'ATOMIC_REQUESTS': True,
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': required_env('DB_NAME'),
+            'USER': required_env('DB_USER'),
+            'PASSWORD': required_env('DB_PASSWORD'),
+            'HOST': required_env('DB_HOST'),
+            'PORT': os.getenv('DB_PORT', '5432'),
+            'ATOMIC_REQUESTS': True,  # Автоматические транзакции для финансовых операций
+            'CONN_MAX_AGE': 600,  # Connection pooling
+        }
+    }
 
 # Custom User Model
 AUTH_USER_MODEL = 'itadis_app.User'
@@ -239,6 +249,7 @@ CORS_ALLOW_HEADERS = [
     "origin",
     "user-agent",
     "x-csrftoken",
+    "idempotency-key",
     "x-requested-with",
 ]
 

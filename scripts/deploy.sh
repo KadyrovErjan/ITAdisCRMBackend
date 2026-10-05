@@ -74,6 +74,28 @@ gunicorn_health_check() {
   [[ "$status_code" == '200' ]]
 }
 
+backup_postgres() {
+  local backup_dir="$REPOSITORY_DIR/backups"
+  local timestamp backup_file checksum_file
+
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_file="$backup_dir/itadiscrm-postgres-${timestamp}.dump"
+  checksum_file="${backup_file}.sha256"
+
+  # This host directory is intentionally outside the web container and is not
+  # part of the Git checkout's tracked application files.
+  install -d -m 0700 "$backup_dir"
+  umask 077
+
+  echo "Creating PostgreSQL backup: $backup_file"
+  docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_file"
+  [[ -s "$backup_file" ]] || { echo "PostgreSQL backup is empty; deployment stopped." >&2; exit 1; }
+
+  sha256sum "$backup_file" > "$checksum_file"
+  docker compose exec -T db pg_restore --list < "$backup_file" > /dev/null
+  echo "PostgreSQL backup verified: $backup_file ($(cut -d ' ' -f 1 "$checksum_file"))"
+}
+
 [[ -d "$REPOSITORY_DIR/.git" ]] || { echo "Missing Git checkout at $REPOSITORY_DIR; complete the documented initial clone first." >&2; exit 1; }
 install_prerequisites
 [[ -f "$APP_DIR/.env" ]] || { echo "Missing $APP_DIR/.env; deployment stopped." >&2; exit 1; }
@@ -86,6 +108,7 @@ cd "$APP_DIR"
 install_nginx_site
 docker compose config --quiet
 docker compose up -d db
+backup_postgres
 docker compose build web
 
 # Run schema/static changes with the newly built image before replacing web.

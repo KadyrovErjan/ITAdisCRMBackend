@@ -155,6 +155,28 @@ class Student(models.Model):
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     full_name = models.CharField(_('ФИО ученика'), max_length=255)
+    phone = models.CharField(_('Телефон'), max_length=32, null=True, blank=True)
+    assistant_name = models.CharField(_('Ассистент'), max_length=255, null=True, blank=True)
+    comment = models.TextField(_('Комментарий'), null=True, blank=True)
+    CONTRACT_STATUS_CHOICES = (
+        ('unknown', _('Не указан')),
+        ('signed', _('Подписан')),
+        ('not_signed', _('Не подписан')),
+    )
+    contract_status = models.CharField(
+        _('Статус договора'),
+        max_length=20,
+        choices=CONTRACT_STATUS_CHOICES,
+        default='unknown',
+    )
+    course_price = models.DecimalField(
+        _('Цена курса'),
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.00'))],
+    )
     group = models.ForeignKey(
         Group,
         on_delete=models.PROTECT,
@@ -192,6 +214,13 @@ class Student(models.Model):
         total = self.transactions.aggregate(total=Sum('amount'))['total']
         return total or Decimal('0.00')
 
+    @property
+    def remaining_balance(self):
+        """Остаток рассчитывается от цены курса и истории транзакций."""
+        if self.course_price is None:
+            return None
+        return self.course_price - self.amount_paid_total
+
 
 class Transaction(models.Model):
     """
@@ -199,6 +228,7 @@ class Transaction(models.Model):
     Согласно ТЗ п.5.4
     """
     TYPE_CHOICES = (
+        ('booking', _('Бронь')),
         ('register', _('Регистрация')),
         ('topup', _('Доплата')),
     )
@@ -237,6 +267,51 @@ class Transaction(models.Model):
     
     def __str__(self):
         return f"{self.student.full_name} - {self.amount} ({self.get_type_display()})"
+
+
+class IdempotencyKey(models.Model):
+    """Результат финансового запроса, защищающий от повторного списания."""
+    OPERATION_CHOICES = (
+        ('registration', _('Регистрация ученика')),
+        ('payment', _('Платёж ученика')),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    cashier = models.ForeignKey(
+        User,
+        on_delete=models.PROTECT,
+        related_name='idempotency_keys',
+        verbose_name=_('Кассир'),
+    )
+    key = models.CharField(_('Ключ идемпотентности'), max_length=64)
+    operation = models.CharField(_('Операция'), max_length=20, choices=OPERATION_CHOICES)
+    request_hash = models.CharField(_('Хэш запроса'), max_length=64)
+    student = models.ForeignKey(
+        Student,
+        on_delete=models.PROTECT,
+        related_name='idempotency_records',
+        null=True,
+        blank=True,
+    )
+    transaction = models.ForeignKey(
+        Transaction,
+        on_delete=models.PROTECT,
+        related_name='idempotency_records',
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(_('Дата создания'), auto_now_add=True)
+
+    class Meta:
+        verbose_name = _('Ключ идемпотентности')
+        verbose_name_plural = _('Ключи идемпотентности')
+        db_table = 'idempotency_keys'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['cashier', 'key'],
+                name='unique_idempotency_key_per_cashier',
+            )
+        ]
 
 
 class Balance(models.Model):
