@@ -12,6 +12,7 @@ import logging
 
 from ..models import User, Student, Group, Transaction, Balance, Collection, Expense, IdempotencyKey
 from .audit import log_action
+from .payment_plans import allocate_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,9 @@ def register_student_payment(
                 transactions.append(Transaction.objects.create(
                     student=student, cashier=cashier, amount=amount, type='register'
                 ))
+            if hasattr(student, 'payment_plan'):
+                for receipt in transactions:
+                    allocate_transaction(receipt)
 
             _increase_cashier_balance(cashier, booking_amount + amount)
 
@@ -248,6 +252,8 @@ def record_student_payment(
                 amount=amount,
                 type=payment_type,
             )
+            if hasattr(student, 'payment_plan'):
+                allocate_transaction(trans)
             _increase_cashier_balance(cashier, amount)
 
             if idempotency_record:

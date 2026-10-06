@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from django.db.models import DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -16,11 +17,12 @@ from ..models import Group, Student
 from ..serializers import (
     StudentSerializer, StudentRegistrationSerializer, 
     StudentDetailsUpdateSerializer, StudentStatusSerializer,
-    StudentTopupSerializer, TransactionSerializer
+    StudentTopupSerializer, TransactionSerializer, PaymentPlanSerializer
 )
-from ..permissions import IsCashier, IsCashierOrDirector
+from ..permissions import IsCashier, IsCashierOrDirector, IsDirector
 from ..services.audit import log_action
 from ..services.finance import register_student_payment, record_student_payment
+from ..services.payment_plans import adjust_plan, build_plan, financial_summary, freeze_student, resume_student, item_outstanding, item_paid
 from ..filters import StudentFilter
 
 
@@ -65,7 +67,7 @@ class StudentViewSet(viewsets.ReadOnlyModelViewSet):
     def get_permissions(self):
         if self.action in {'register', 'payments', 'booking'}:
             return [IsAuthenticated(), IsCashier()]
-        if self.action in {'change_status', 'transfer_group', 'update_details'}:
+        if self.action in {'change_status', 'transfer_group', 'update_details', 'freeze', 'resume', 'payment_plan'}:
             return [IsAuthenticated(), IsCashierOrDirector()]
         return super().get_permissions()
 
@@ -133,10 +135,21 @@ class StudentViewSet(viewsets.ReadOnlyModelViewSet):
         student = self.get_object()
         serializer = StudentStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        old_status = student.status
+        old_status = student.effective_learning_status
         new_status = serializer.validated_data['status']
-        student.status = new_status
-        student.save(update_fields=['status'])
+        # Legacy debt is intentionally not a learning state. Keep the old DB
+        # column untouched while new clients consume learning_status.
+        new_status = {'debt': 'active', 'expelled': 'archived'}.get(new_status, new_status)
+        # A planned student's frozen state must always have a pause record.
+        if new_status == 'frozen' and hasattr(student, 'payment_plan'):
+            freeze_student(student, request.user, reason=request.data.get('reason', ''))
+            student.refresh_from_db()
+        elif new_status == 'active' and student.effective_learning_status == 'frozen' and hasattr(student, 'payment_plan'):
+            resume_student(student, request.user)
+            student.refresh_from_db()
+        else:
+            student.learning_status = new_status
+            student.save(update_fields=['learning_status'])
         log_action(
             user=request.user,
             action='student.status.change',
@@ -145,6 +158,55 @@ class StudentViewSet(viewsets.ReadOnlyModelViewSet):
             payload={'old_status': old_status, 'new_status': new_status},
         )
         
+        return Response(StudentSerializer(student).data)
+
+    @action(detail=True, methods=['get', 'post', 'patch'], url_path='payment-plan')
+    def payment_plan(self, request, pk=None):
+        student = self.get_object()
+        if request.method == 'GET':
+            try:
+                plan = student.payment_plan
+            except Exception:
+                return Response({'detail': 'График не подтверждён', 'financial_summary': financial_summary(student)}, status=status.HTTP_404_NOT_FOUND)
+            items = []
+            for item in plan.items.prefetch_related('allocations').order_by('due_date', 'created_at'):
+                paid = item_paid(item)
+                outstanding = item_outstanding(item)
+                items.append({'id': item.id, 'due_date': item.due_date, 'amount_due': item.amount_due,
+                              'amount_paid': paid, 'outstanding': outstanding,
+                              'status': 'paid' if outstanding == 0 else ('overdue' if item.due_date < timezone.localdate() else ('due' if item.due_date == timezone.localdate() else 'upcoming'))})
+            return Response({'id': plan.id, 'payment_method': plan.payment_method, 'period_count': plan.period_count, 'start_date': plan.start_date, 'items': items, 'financial_summary': financial_summary(student)})
+        serializer = PaymentPlanSerializer(data=request.data, partial=request.method == 'PATCH')
+        serializer.is_valid(raise_exception=True)
+        if request.method == 'PATCH':
+            plan = adjust_plan(student, items=serializer.validated_data.get('items') or [], actor=request.user)
+            return Response({'id': plan.id, 'financial_summary': financial_summary(student)})
+        plan_data = serializer.validated_data.copy()
+        plan_data['method'] = plan_data.pop('payment_method')
+        plan_data.setdefault('items', None)
+        plan = build_plan(student, actor=request.user, **plan_data)
+        return Response({'id': plan.id, 'financial_summary': financial_summary(student)}, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'], url_path='financial-summary')
+    def financial_summary_view(self, request, pk=None):
+        return Response(financial_summary(self.get_object()))
+
+    @action(detail=True, methods=['post'])
+    def freeze(self, request, pk=None):
+        # Return the student representation, not the pause id.  The frontend
+        # treats this response as the new source of truth for its student
+        # cache; returning a pause id here made it subsequently request the
+        # payment plan/history for the pause instead of the student.
+        student = self.get_object()
+        freeze_student(student, request.user, reason=request.data.get('reason', ''))
+        student.refresh_from_db()
+        return Response(StudentSerializer(student).data)
+
+    @action(detail=True, methods=['post'])
+    def resume(self, request, pk=None):
+        student = self.get_object()
+        resume_student(student, request.user)
+        student.refresh_from_db()
         return Response(StudentSerializer(student).data)
     
     @extend_schema(

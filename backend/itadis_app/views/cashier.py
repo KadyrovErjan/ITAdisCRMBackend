@@ -1,5 +1,6 @@
 """Read-only dashboard data for the cashier workspace."""
 from decimal import Decimal
+from datetime import timedelta
 
 from django.db.models import DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
@@ -11,6 +12,7 @@ from rest_framework.response import Response
 from ..models import Balance, Student, Transaction
 from ..permissions import IsCashier
 from ..serializers import StudentSerializer, TransactionSerializer
+from ..services.payment_plans import financial_summary
 
 
 def _with_financial_totals(queryset):
@@ -44,7 +46,9 @@ def cashier_dashboard(request):
 
     today_transactions = own_transactions.filter(created_at__date=today)
     month_transactions = own_transactions.filter(created_at__date__gte=month_start)
-    debt_students = own_students.filter(course_price__isnull=False, remaining_balance_annotated__gt=0)
+    summaries = [financial_summary(student, today=today) for student in own_students]
+    overdue = [item for item in summaries if Decimal(item['overdue_amount']) > 0]
+    upcoming = [item for item in summaries if item['next_payment_date'] and today.isoformat() <= item['next_payment_date'] <= (today + timedelta(days=3)).isoformat()]
     balance = Balance.objects.filter(user=request.user).values_list('amount', flat=True).first() or Decimal('0.00')
 
     return Response({
@@ -62,7 +66,11 @@ def cashier_dashboard(request):
                 output_field=DecimalField(max_digits=12, decimal_places=2),
             )
         )['total']),
-        'debt_students_count': debt_students.count(),
+        'debt_students_count': len(overdue),
+        'overdue_students_count': len(overdue),
+        'overdue_amount': str(sum((Decimal(item['overdue_amount']) for item in overdue), Decimal('0.00'))),
+        'upcoming_payments_count': len(upcoming),
+        'upcoming_amount': str(sum((Decimal(item['next_payment_amount'] or '0') for item in upcoming), Decimal('0.00'))),
         'recent_transactions': TransactionSerializer(own_transactions[:10], many=True).data,
         'recent_students': StudentSerializer(own_students.order_by('-created_at')[:10], many=True).data,
     })

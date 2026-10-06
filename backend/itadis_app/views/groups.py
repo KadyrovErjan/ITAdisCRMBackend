@@ -8,8 +8,13 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.utils.translation import gettext_lazy as _
+from decimal import Decimal
+from django.db.models import DecimalField, Q, Sum, Value
+from django.db.models.functions import Coalesce
+from django.db.models import Prefetch
+from django.shortcuts import get_object_or_404
 
-from ..models import Group, Student
+from ..models import Group, Student, PaymentPlan, PaymentScheduleItem
 from ..serializers import GroupSerializer, GroupProgressSerializer, StudentSerializer
 from ..permissions import IsOwnerCashierOrReadOnlyForAccountantDirector
 from ..services.audit import log_action
@@ -115,11 +120,20 @@ class GroupViewSet(viewsets.ModelViewSet):
         GET /api/v1/groups/{id}/students/
         Список учеников группы с суммами оплат
         """
-        group = self.get_object()
-        students = group.students.all().select_related('registered_by', 'group')
+        # `search` on this action targets a student's name or phone.  Calling
+        # self.get_object() would apply the GroupFilter's name/subject search
+        # first, incorrectly returning 404 for a phone lookup.
+        group = get_object_or_404(self.get_queryset(), pk=pk)
+        money = DecimalField(max_digits=12, decimal_places=2)
+        students = group.students.select_related('registered_by', 'group').annotate(
+            total_paid=Coalesce(Sum('transactions__amount'), Value(Decimal('0.00')), output_field=money),
+            booking_paid=Coalesce(Sum('transactions__amount', filter=Q(transactions__type='booking')), Value(Decimal('0.00')), output_field=money),
+        ).prefetch_related(
+            Prefetch('payment_plan__items', queryset=PaymentScheduleItem.objects.prefetch_related('allocations').order_by('due_date', 'created_at')),
+        )
         search = request.query_params.get('search', '').strip()
         if search:
-            students = students.filter(full_name__icontains=search)
+            students = students.filter(Q(full_name__icontains=search) | Q(phone__icontains=search))
         serializer = StudentSerializer(students, many=True)
         # Возвращаем в формате пагинации для совместимости с frontend
         return Response({

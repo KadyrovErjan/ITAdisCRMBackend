@@ -107,6 +107,12 @@ class Group(models.Model):
     schedule = models.CharField(_('Расписание'), max_length=255)
     total_lessons = models.PositiveIntegerField(_('Общее количество занятий'))
     current_lesson = models.PositiveIntegerField(_('Текущее занятие'), default=0)
+    # Nullable: no curriculum is inferred for existing production groups.
+    technology = models.CharField(_('Направление'), max_length=100, null=True, blank=True)
+    duration_months = models.PositiveIntegerField(_('Длительность в месяцах'), null=True, blank=True)
+    study_days_per_week = models.PositiveSmallIntegerField(_('Учебных дней в неделю'), null=True, blank=True)
+    start_date = models.DateField(_('Дата начала'), null=True, blank=True)
+    end_date = models.DateField(_('Дата окончания'), null=True, blank=True)
     status = models.CharField(
         _('Статус группы'),
         max_length=20,
@@ -196,6 +202,17 @@ class Student(models.Model):
         default='active',
         help_text=_('Статус оплаты/активности ученика')
     )
+    LEARNING_STATUS_CHOICES = (
+        ('active', _('Активный')),
+        ('frozen', _('Заморожен')),
+        ('completed', _('Завершил обучение')),
+        ('archived', _('Архивирован')),
+    )
+    # Legacy status stays intact. Null avoids silently reinterpreting old rows.
+    learning_status = models.CharField(
+        _('Статус обучения'), max_length=20, choices=LEARNING_STATUS_CHOICES,
+        null=True, blank=True,
+    )
     created_at = models.DateTimeField(_('Дата регистрации'), auto_now_add=True)
     
     class Meta:
@@ -220,6 +237,12 @@ class Student(models.Model):
         if self.course_price is None:
             return None
         return self.course_price - self.amount_paid_total
+
+    @property
+    def effective_learning_status(self):
+        if self.learning_status:
+            return self.learning_status
+        return {'frozen': 'frozen', 'expelled': 'archived'}.get(self.status, 'active')
 
 
 class Transaction(models.Model):
@@ -267,6 +290,80 @@ class Transaction(models.Model):
     
     def __str__(self):
         return f"{self.student.full_name} - {self.amount} ({self.get_type_display()})"
+
+
+class PaymentPlan(models.Model):
+    """Confirmed contract schedule; never created for legacy students implicitly."""
+    METHOD_CHOICES = (('full', _('Полностью')), ('monthly', _('Ежемесячно')), ('custom', _('Индивидуально')))
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    student = models.OneToOneField(Student, on_delete=models.PROTECT, related_name='payment_plan')
+    payment_method = models.CharField(max_length=12, choices=METHOD_CHOICES)
+    period_count = models.PositiveSmallIntegerField(default=1)
+    start_date = models.DateField()
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name='created_payment_plans')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'payment_plans'
+
+
+class PaymentScheduleItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    plan = models.ForeignKey(PaymentPlan, on_delete=models.PROTECT, related_name='items')
+    student = models.ForeignKey(Student, on_delete=models.PROTECT, related_name='payment_schedule_items')
+    due_date = models.DateField()
+    amount_due = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'payment_schedule_items'
+        ordering = ['due_date', 'created_at']
+
+
+class PaymentAllocation(models.Model):
+    """Immutable attribution of an actual receipt to a contractual instalment."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    transaction = models.ForeignKey(Transaction, on_delete=models.PROTECT, related_name='payment_allocations')
+    schedule_item = models.ForeignKey(PaymentScheduleItem, on_delete=models.PROTECT, related_name='allocations')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'payment_allocations'
+        constraints = [models.UniqueConstraint(fields=['transaction', 'schedule_item'], name='unique_transaction_schedule_allocation')]
+
+
+class PaymentSchedulePause(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    student = models.ForeignKey(Student, on_delete=models.PROTECT, related_name='payment_pauses')
+    started_on = models.DateField()
+    ended_on = models.DateField(null=True, blank=True)
+    shifted_days = models.PositiveIntegerField(default=0)
+    reason = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name='created_payment_pauses')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'payment_schedule_pauses'
+
+
+class PaymentNotification(models.Model):
+    KIND_CHOICES = (('upcoming', _('Скоро платёж')), ('overdue', _('Просрочен платёж')))
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    recipient = models.ForeignKey(User, on_delete=models.PROTECT, related_name='payment_notifications')
+    student = models.ForeignKey(Student, on_delete=models.PROTECT, related_name='payment_notifications')
+    schedule_item = models.ForeignKey(PaymentScheduleItem, on_delete=models.PROTECT, related_name='notifications')
+    kind = models.CharField(max_length=12, choices=KIND_CHOICES)
+    event_key = models.CharField(max_length=200, unique=True)
+    message = models.TextField()
+    read_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'payment_notifications'
 
 
 class IdempotencyKey(models.Model):

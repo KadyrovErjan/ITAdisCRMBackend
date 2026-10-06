@@ -1,11 +1,15 @@
 from decimal import Decimal
+from datetime import date, timedelta
 
 from django.db import IntegrityError
+from django.db.models import Sum
 from django.urls import reverse
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 
-from .models import AuditLog, Balance, Group, IdempotencyKey, Student, Transaction, User
+from .models import AuditLog, Balance, Group, IdempotencyKey, Student, Transaction, User, PaymentAllocation, PaymentNotification, PaymentSchedulePause
+from .services.payment_plans import build_plan, financial_summary, generate_notifications, monthly_amounts, allocate_unallocated_transactions, freeze_student, resume_student
 
 
 class CashierApiTests(APITestCase):
@@ -140,7 +144,9 @@ class CashierApiTests(APITestCase):
         detail = self.client.get(reverse('student-detail', args=[student_id]))
         self.assertEqual(student.amount_paid_total, Decimal('45000.00'))
         self.assertEqual(student.remaining_balance, Decimal('0.00'))
-        self.assertEqual(detail.data['payment_status'], 'paid')
+        # Existing registrations without an explicitly confirmed schedule do
+        # not infer a contractual debt/payment state.
+        self.assertEqual(detail.data['payment_status'], 'unknown')
         self.assertEqual(Balance.objects.get(user=self.cashier).amount, Decimal('45000.00'))
 
     def test_overpayment_and_legacy_student_without_course_price(self):
@@ -155,7 +161,7 @@ class CashierApiTests(APITestCase):
         )
         legacy_response = self.client.get(reverse('student-detail', args=[legacy.id]))
         self.assertEqual(Decimal(overpaid.data['remaining_balance']), Decimal('-5000.00'))
-        self.assertEqual(overpaid.data['payment_status'], 'overpaid')
+        self.assertEqual(overpaid.data['payment_status'], 'unknown')
         self.assertIsNone(legacy_response.data['remaining_balance'])
         self.assertEqual(legacy_response.data['payment_status'], 'unknown')
 
@@ -201,4 +207,175 @@ class CashierApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(Decimal(response.data['balance']), Decimal('15000.00'))
         self.assertEqual(Decimal(response.data['today_received']), Decimal('15000.00'))
-        self.assertEqual(response.data['debt_students_count'], 1)
+        self.assertEqual(response.data['debt_students_count'], 0)
+
+
+class PaymentPlanServiceTests(APITestCase):
+    def setUp(self):
+        self.director = User.objects.create_user(login='director-plan', password='safe-password-123', full_name='Director', role='director')
+        self.cashier = User.objects.create_user(login='cashier-plan', password='safe-password-123', full_name='Cashier', role='cashier')
+        self.group = Group.objects.create(name='Python49', subject='Python', schedule='Mon', total_lessons=12, created_by=self.cashier)
+        self.student = Student.objects.create(full_name='Asan', group=self.group, registered_by=self.cashier, course_price=Decimal('60000.00'))
+
+    def test_monthly_rounding_and_legacy_receipt_allocation(self):
+        self.assertEqual(monthly_amounts(Decimal('100.00'), 3), [Decimal('33.33'), Decimal('33.33'), Decimal('33.34')])
+        booking = Transaction.objects.create(student=self.student, cashier=self.cashier, type='booking', amount=Decimal('5000.00'))
+        plan = build_plan(self.student, method='monthly', period_count=6, start_date=date.today(), items=None, actor=self.director)
+        self.assertEqual(plan.items.count(), 6)
+        self.assertEqual(PaymentAllocation.objects.filter(transaction=booking).aggregate(total=Sum('amount'))['total'], Decimal('5000.00'))
+        allocate_unallocated_transactions(self.student)
+        self.assertEqual(PaymentAllocation.objects.filter(transaction=booking).count(), 1)
+
+    def test_group_student_search_matches_phone_as_well_as_name(self):
+        self.student.phone = '+996700000099'
+        self.student.save(update_fields=['phone'])
+        self.client.force_authenticate(self.cashier)
+        response = self.client.get(reverse('group-list'), {'student_name': '700000099'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(str(response.data['results'][0]['id']), str(self.group.id))
+        group_students = self.client.get(
+            reverse('group-students', args=[self.group.id]), {'search': '700000099'}
+        )
+        self.assertEqual(group_students.status_code, status.HTTP_200_OK)
+        self.assertEqual(group_students.data['count'], 1)
+
+    def test_due_overdue_ahead_and_notifications_are_idempotent(self):
+        start = date.today() - timedelta(days=1)
+        build_plan(self.student, method='custom', period_count=2, start_date=start, items=[
+            {'due_date': start, 'amount_due': Decimal('10000.00')},
+            {'due_date': start + timedelta(days=30), 'amount_due': Decimal('50000.00')},
+        ], actor=self.director)
+        Transaction.objects.create(student=self.student, cashier=self.cashier, type='topup', amount=Decimal('4000.00'))
+        allocate_unallocated_transactions(self.student)
+        summary = financial_summary(self.student, today=date.today())
+        self.assertEqual(summary['overdue_amount'], '6000.00')
+        self.assertEqual(summary['contract_remaining'], '56000.00')
+        self.assertEqual(generate_notifications(today=date.today()), 1)
+        self.assertEqual(generate_notifications(today=date.today()), 0)
+        self.assertEqual(PaymentNotification.objects.count(), 1)
+
+    def test_fixed_date_statuses_credit_and_allocation_invariant(self):
+        fixed = date(2026, 11, 5)
+        build_plan(self.student, method='custom', period_count=3, start_date=fixed, items=[
+            {'due_date': fixed - timedelta(days=1), 'amount_due': Decimal('10000.00')},
+            {'due_date': fixed, 'amount_due': Decimal('10000.00')},
+            {'due_date': fixed + timedelta(days=1), 'amount_due': Decimal('40000.00')},
+        ], actor=self.director)
+        self.assertEqual(financial_summary(self.student, today=fixed - timedelta(days=2))['payment_status'], 'upcoming')
+        self.assertEqual(financial_summary(self.student, today=fixed - timedelta(days=1))['payment_status'], 'due')
+        self.assertEqual(financial_summary(self.student, today=fixed)['payment_status'], 'overdue')
+        receipt = Transaction.objects.create(student=self.student, cashier=self.cashier, type='topup', amount=Decimal('25000.00'))
+        allocate_unallocated_transactions(self.student)
+        allocated = PaymentAllocation.objects.filter(transaction=receipt).aggregate(total=Sum('amount'))['total']
+        self.assertLessEqual(allocated, receipt.amount)
+        self.assertEqual(allocated, Decimal('25000.00'))
+        extra = Transaction.objects.create(student=self.student, cashier=self.cashier, type='topup', amount=Decimal('40000.00'))
+        allocate_unallocated_transactions(self.student)
+        self.assertEqual(financial_summary(self.student, today=fixed)['credit_amount'], '5000.00')
+        self.assertLessEqual(PaymentAllocation.objects.filter(transaction=extra).aggregate(total=Sum('amount'))['total'], extra.amount)
+
+    def test_learning_status_and_freeze_preserve_existing_overdue(self):
+        fixed = date(2026, 11, 5)
+        build_plan(self.student, method='full', period_count=1, start_date=fixed - timedelta(days=1), items=None, actor=self.director)
+        self.client.force_authenticate(self.cashier)
+        response = self.client.patch(reverse('student-change-status', args=[self.student.id]), {'status': 'frozen'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.learning_status, 'frozen')
+        self.assertEqual(self.student.effective_learning_status, 'frozen')
+        self.assertEqual(financial_summary(self.student, today=fixed)['overdue_amount'], '60000.00')
+
+    def test_freeze_and_resume_return_student_not_pause_identifier(self):
+        build_plan(self.student, method='full', period_count=1, start_date=date(2026, 11, 5), items=None, actor=self.director)
+        self.client.force_authenticate(self.cashier)
+
+        frozen = self.client.post(reverse('student-freeze', args=[self.student.id]), {}, format='json')
+        self.assertEqual(frozen.status_code, status.HTTP_200_OK)
+        self.assertEqual(str(frozen.data['id']), str(self.student.id))
+        self.assertEqual(frozen.data['learning_status'], 'frozen')
+        self.assertEqual(PaymentSchedulePause.objects.filter(student=self.student, ended_on__isnull=True).count(), 1)
+
+        resumed = self.client.post(reverse('student-resume', args=[self.student.id]), {}, format='json')
+        self.assertEqual(resumed.status_code, status.HTTP_200_OK)
+        self.assertEqual(str(resumed.data['id']), str(self.student.id))
+        self.assertEqual(resumed.data['learning_status'], 'active')
+
+    def test_custom_plan_bad_sum_is_rejected_and_legacy_student_is_unknown(self):
+        self.assertEqual(financial_summary(self.student)['payment_status'], 'unknown')
+        self.client.force_authenticate(self.cashier)
+        response = self.client.post(reverse('student-payment-plan', args=[self.student.id]), {
+            'payment_method': 'custom', 'start_date': '2026-11-05', 'items': [
+                {'due_date': '2026-11-05', 'amount_due': '59000.00'},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cashier_cannot_adjust_allocated_plan_director_can_audit_future_row(self):
+        plan = build_plan(self.student, method='monthly', period_count=6, start_date=date(2026, 11, 5), items=None, actor=self.director)
+        receipt = Transaction.objects.create(student=self.student, cashier=self.cashier, type='topup', amount=Decimal('10000.00'))
+        allocate_unallocated_transactions(self.student)
+        items = list(plan.items.order_by('due_date'))
+        payload = {'items': [{'id': str(row.id), 'due_date': row.due_date.isoformat(), 'amount_due': str(row.amount_due)} for row in items]}
+        self.client.force_authenticate(self.cashier)
+        self.assertEqual(self.client.patch(reverse('student-payment-plan', args=[self.student.id]), payload, format='json').status_code, status.HTTP_400_BAD_REQUEST)
+        payload['items'][1]['amount_due'] = '11000.00'
+        payload['items'][5]['amount_due'] = '9000.00'
+        self.client.force_authenticate(self.director)
+        response = self.client.patch(reverse('student-payment-plan', args=[self.student.id]), payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(AuditLog.objects.filter(action='payment_plan.adjust').exists())
+        self.assertLessEqual(PaymentAllocation.objects.filter(transaction=receipt).aggregate(total=Sum('amount'))['total'], receipt.amount)
+
+    def test_resume_shifts_only_items_not_due_before_pause_and_repeated_freeze_is_safe(self):
+        fixed = date(2026, 11, 5)
+        plan = build_plan(self.student, method='custom', period_count=2, start_date=fixed, items=[
+            {'due_date': fixed - timedelta(days=1), 'amount_due': Decimal('10000.00')},
+            {'due_date': fixed + timedelta(days=2), 'amount_due': Decimal('50000.00')},
+        ], actor=self.director)
+        freeze_student(self.student, self.cashier, started_on=fixed)
+        with self.assertRaises(ValidationError):
+            freeze_student(self.student, self.cashier, started_on=fixed)
+        resume_student(self.student, self.cashier, ended_on=fixed + timedelta(days=5))
+        items = list(plan.items.order_by('due_date'))
+        self.assertEqual(items[0].due_date, fixed - timedelta(days=1))
+        self.assertEqual(items[1].due_date, fixed + timedelta(days=7))
+        self.assertEqual(PaymentSchedulePause.objects.filter(student=self.student, ended_on__isnull=True).count(), 0)
+
+    def test_resume_does_not_shift_a_fully_paid_future_period(self):
+        fixed = date(2026, 11, 5)
+        plan = build_plan(self.student, method='custom', period_count=2, start_date=fixed, items=[
+            {'due_date': fixed + timedelta(days=2), 'amount_due': Decimal('10000.00')},
+            {'due_date': fixed + timedelta(days=32), 'amount_due': Decimal('50000.00')},
+        ], actor=self.director)
+        paid_period, unpaid_period = plan.items.order_by('due_date')
+        receipt = Transaction.objects.create(
+            student=self.student, cashier=self.cashier, type='topup', amount=Decimal('10000.00')
+        )
+        allocate_unallocated_transactions(self.student)
+        self.assertEqual(
+            PaymentAllocation.objects.filter(transaction=receipt).aggregate(total=Sum('amount'))['total'],
+            Decimal('10000.00'),
+        )
+
+        freeze_student(self.student, self.cashier, started_on=fixed)
+        resume_student(self.student, self.cashier, ended_on=fixed + timedelta(days=5))
+        paid_period.refresh_from_db()
+        unpaid_period.refresh_from_db()
+
+        self.assertEqual(paid_period.due_date, fixed + timedelta(days=2))
+        self.assertEqual(unpaid_period.due_date, fixed + timedelta(days=37))
+
+    def test_partial_notification_resolves_after_payment(self):
+        fixed = date(2026, 11, 5)
+        build_plan(self.student, method='full', period_count=1, start_date=fixed - timedelta(days=1), items=None, actor=self.director)
+        Transaction.objects.create(student=self.student, cashier=self.cashier, type='topup', amount=Decimal('1000.00'))
+        allocate_unallocated_transactions(self.student)
+        self.assertEqual(generate_notifications(today=fixed), 1)
+        notification = PaymentNotification.objects.get()
+        self.assertIn('Осталась задолженность', notification.message)
+        Transaction.objects.create(student=self.student, cashier=self.cashier, type='topup', amount=Decimal('59000.00'))
+        allocate_unallocated_transactions(self.student)
+        generate_notifications(today=fixed)
+        notification.refresh_from_db()
+        self.assertIsNotNone(notification.resolved_at)

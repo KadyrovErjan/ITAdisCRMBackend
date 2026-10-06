@@ -290,7 +290,8 @@ class GroupSerializer(serializers.ModelSerializer):
     class Meta:
         model = Group
         fields = [
-            'id', 'name', 'subject', 'schedule', 
+            'id', 'name', 'subject', 'technology', 'schedule', 'duration_months',
+            'study_days_per_week', 'start_date', 'end_date',
             'total_lessons', 'current_lesson', 'status',
             'created_by', 'created_by_name', 
             'created_at', 'student_count', 'progress_percent'
@@ -338,20 +339,23 @@ class GroupProgressSerializer(serializers.Serializer):
 class StudentSerializer(serializers.ModelSerializer):
     """Serializer для учеников"""
     group_name = serializers.CharField(source='group.name', read_only=True)
+    group_technology = serializers.CharField(source='group.technology', read_only=True)
     registered_by_name = serializers.CharField(source='registered_by.full_name', read_only=True)
     amount_paid_total = serializers.SerializerMethodField(read_only=True)
     booking_total = serializers.SerializerMethodField(read_only=True)
     remaining_balance = serializers.SerializerMethodField(read_only=True)
     payment_status = serializers.SerializerMethodField(read_only=True)
+    learning_status = serializers.SerializerMethodField(read_only=True)
+    financial_summary = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = Student
         fields = [
-            'id', 'full_name', 'group', 'group_name',
+            'id', 'full_name', 'group', 'group_name', 'group_technology',
             'registered_by', 'registered_by_name',
             'phone', 'assistant_name', 'comment', 'contract_status', 'course_price',
-            'status', 'created_at', 'amount_paid_total', 'booking_total',
-            'remaining_balance', 'payment_status'
+            'status', 'learning_status', 'created_at', 'amount_paid_total', 'booking_total',
+            'remaining_balance', 'payment_status', 'financial_summary'
         ]
         read_only_fields = ['id', 'registered_by', 'created_at']
     
@@ -372,6 +376,17 @@ class StudentSerializer(serializers.ModelSerializer):
         return str(remaining) if remaining is not None else None
 
     def get_payment_status(self, obj):
+        from .services.payment_plans import financial_summary
+        return financial_summary(obj)['payment_status']
+
+    def get_learning_status(self, obj):
+        return obj.effective_learning_status
+
+    def get_financial_summary(self, obj):
+        from .services.payment_plans import financial_summary
+        return financial_summary(obj)
+
+    def get_legacy_payment_status(self, obj):
         remaining = getattr(obj, 'remaining_balance_annotated', None)
         if remaining is None and obj.course_price is not None:
             remaining = obj.remaining_balance
@@ -428,7 +443,15 @@ class StudentDetailsUpdateSerializer(serializers.ModelSerializer):
 
 
 class StudentStatusSerializer(serializers.Serializer):
-    status = serializers.ChoiceField(choices=['active', 'debt', 'frozen', 'expelled'])
+    # Accept legacy values at the boundary, but never use debt as finance state.
+    status = serializers.ChoiceField(choices=['active', 'frozen', 'completed', 'archived', 'debt', 'expelled'])
+
+
+class PaymentPlanSerializer(serializers.Serializer):
+    payment_method = serializers.ChoiceField(choices=['full', 'monthly', 'custom'])
+    period_count = serializers.IntegerField(min_value=1, required=False, default=1)
+    start_date = serializers.DateField()
+    items = serializers.ListField(child=serializers.DictField(), required=False)
 
 
 # ============= Transaction Serializers =============

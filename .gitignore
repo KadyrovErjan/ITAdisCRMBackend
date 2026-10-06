@@ -12,6 +12,12 @@ build/
 # Django
 db.sqlite3
 db.sqlite3-journal
+# Local synthetic E2E databases must never be committed.
+local_e2e.sqlite3
+local_e2e.sqlite3-*
+# Django's locally created test database.
+test.sqlite3
+test.sqlite3-*
 staticfiles/
 media/avatars/
 *.log

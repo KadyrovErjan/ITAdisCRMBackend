@@ -15,7 +15,7 @@ from .views.balances import BalanceViewSet
 from .views.collections import CollectionViewSet
 from .views.expenses import ExpenseViewSet
 from .views.audit import AuditLogViewSet
-from .views import analytics, cashier
+from .views import analytics, cashier, notifications
 
 # Router для ViewSets
 router = DefaultRouter()
@@ -41,6 +41,8 @@ urlpatterns = [
     path('analytics/cashiers/', analytics.analytics_cashiers, name='analytics-cashiers'),
     path('analytics/groups/', analytics.analytics_groups, name='analytics-groups'),
     path('cashier/dashboard/', cashier.cashier_dashboard, name='cashier-dashboard'),
+    path('payment-notifications/', notifications.payment_notifications, name='payment-notifications'),
+    path('payment-notifications/<uuid:pk>/read/', notifications.mark_payment_notification_read, name='payment-notification-read'),
     
     # ViewSets
     path('', include(router.urls)),

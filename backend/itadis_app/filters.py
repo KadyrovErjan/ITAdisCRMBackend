@@ -118,8 +118,10 @@ class GroupFilter(filters.FilterSet):
         )
 
     def filter_student_name(self, queryset, name, value):
-        """Возвращает группы, в которых есть ученик с указанным именем."""
-        return queryset.filter(students__full_name__icontains=value).distinct()
+        """Возвращает группы, в которых имя или телефон ученика совпадают с поиском."""
+        return queryset.filter(
+            Q(students__full_name__icontains=value) | Q(students__phone__icontains=value)
+        ).distinct()
     
     class Meta:
         model = Group
