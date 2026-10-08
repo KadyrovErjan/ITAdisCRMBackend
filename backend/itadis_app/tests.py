@@ -100,6 +100,70 @@ class CashierApiTests(APITestCase):
         self.client.force_authenticate(self.cashier)
         response = self.client.post(reverse('student-payments', args=[student.id]), {'amount': '100'}, format='json')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        details = self.client.patch(
+            reverse('student-update-details', args=[student.id]), {'comment': 'Not mine'}, format='json'
+        )
+        self.assertEqual(details.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_cashier_can_edit_own_student_and_change_price_without_plan(self):
+        response = self.register_student(amount='100.00', booking_amount='0.00')
+        student_id = response.data['student']['id']
+        update = self.client.patch(
+            reverse('student-update-details', args=[student_id]),
+            {
+                'full_name': 'Aida Updated',
+                'phone': '+996700000001',
+                'comment': 'Updated locally',
+                'assistant_name': 'Assistant One',
+                'contract_status': 'signed',
+                'course_price': '50000.00',
+            },
+            format='json',
+        )
+        self.assertEqual(update.status_code, status.HTTP_200_OK)
+        self.assertEqual(update.data['full_name'], 'Aida Updated')
+        self.assertEqual(Decimal(update.data['course_price']), Decimal('50000.00'))
+        student = Student.objects.get(id=student_id)
+        self.assertEqual(student.transactions.count(), 1)
+        self.assertEqual(student.transactions.get().amount, Decimal('100.00'))
+        self.assertEqual(Balance.objects.get(user=self.cashier).amount, Decimal('100.00'))
+        self.assertEqual(student.comment, 'Updated locally')
+        self.assertTrue(AuditLog.objects.filter(action='student.details.update', object_id=student_id).exists())
+
+    def test_course_price_zero_empty_and_invalid_values_are_safe(self):
+        student = Student.objects.create(full_name='Price Edge', group=self.group, registered_by=self.cashier)
+        self.client.force_authenticate(self.cashier)
+        zero = self.client.patch(
+            reverse('student-update-details', args=[student.id]), {'course_price': '0.00'}, format='json'
+        )
+        self.assertEqual(zero.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(zero.data['course_price']), Decimal('0.00'))
+        empty = self.client.patch(
+            reverse('student-update-details', args=[student.id]), {'course_price': None}, format='json'
+        )
+        self.assertEqual(empty.status_code, status.HTTP_200_OK)
+        self.assertIsNone(empty.data['course_price'])
+        invalid = self.client.patch(
+            reverse('student-update-details', args=[student.id]), {'course_price': '-1.00'}, format='json'
+        )
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+        student.refresh_from_db()
+        self.assertIsNone(student.course_price)
+
+    def test_course_price_edit_is_rejected_after_payment_plan_exists(self):
+        student = Student.objects.create(
+            full_name='Planned Student', group=self.group, registered_by=self.cashier,
+            course_price=Decimal('60000.00'),
+        )
+        build_plan(student, method='full', period_count=1, start_date=date.today(), items=None, actor=self.cashier)
+        self.client.force_authenticate(self.cashier)
+        response = self.client.patch(
+            reverse('student-update-details', args=[student.id]),
+            {'course_price': '65000.00'}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        student.refresh_from_db()
+        self.assertEqual(student.course_price, Decimal('60000.00'))
 
     def test_debt_filter_and_phone_search_are_server_side(self):
         self.register_student()

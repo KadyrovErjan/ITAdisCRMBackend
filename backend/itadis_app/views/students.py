@@ -320,7 +320,7 @@ class StudentViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated, IsCashierOrDirector])
     def update_details(self, request, pk=None):
-        """Изменить только разрешённые не финансовые данные ученика."""
+        """Изменить разрешённые данные без изменения поступлений или графика."""
         student = self.get_object()
         serializer = StudentDetailsUpdateSerializer(student, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)

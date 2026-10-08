@@ -435,11 +435,24 @@ class StudentTopupSerializer(serializers.Serializer):
 
 
 class StudentDetailsUpdateSerializer(serializers.ModelSerializer):
-    """Разрешённые кассиру нефинансовые поля ученика."""
+    """Разрешённые для изменения данные ученика.
+
+    Стоимость можно менять, пока у ученика нет подтверждённого графика.
+    После создания PaymentPlan договорная сумма и его пункты должны
+    меняться только через защищённый сценарий корректировки графика.
+    """
 
     class Meta:
         model = Student
-        fields = ['full_name', 'phone', 'assistant_name', 'comment', 'contract_status']
+        fields = ['full_name', 'phone', 'assistant_name', 'comment', 'contract_status', 'course_price']
+
+    def validate_course_price(self, value):
+        if value != self.instance.course_price and hasattr(self.instance, 'payment_plan'):
+            raise serializers.ValidationError(
+                'Нельзя изменить стоимость после подтверждения графика платежей. '
+                'Скорректируйте график в соответствии с финансовыми правилами.'
+            )
+        return value
 
 
 class StudentStatusSerializer(serializers.Serializer):
