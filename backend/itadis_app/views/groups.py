@@ -13,11 +13,14 @@ from django.db.models import DecimalField, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404
+from django.http import HttpResponse
+from io import BytesIO
 
 from ..models import Group, Student, PaymentPlan, PaymentScheduleItem
 from ..serializers import GroupSerializer, GroupProgressSerializer, StudentSerializer
 from ..permissions import IsOwnerCashierOrReadOnlyForAccountantDirector
 from ..services.audit import log_action
+from ..services.crm_excel_export import build_crm_groups_export
 from ..filters import GroupFilter
 
 
@@ -61,6 +64,18 @@ class GroupViewSet(viewsets.ModelViewSet):
             object_id=group.id,
             payload={'group_name': group.name}
         )
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request):
+        """Download only confirmed CRM group/student/payment data visible to the user."""
+        output = BytesIO()
+        build_crm_groups_export(self.get_queryset()).save(output)
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = 'attachment; filename="itadis-groups.xlsx"'
+        return response
     
     @extend_schema(
         tags=['groups'],

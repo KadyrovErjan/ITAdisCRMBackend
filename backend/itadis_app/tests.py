@@ -1,5 +1,7 @@
 from decimal import Decimal
 from datetime import date, timedelta
+from io import BytesIO
+from openpyxl import load_workbook
 
 from django.db import IntegrityError
 from django.db.models import Sum
@@ -443,3 +445,80 @@ class PaymentPlanServiceTests(APITestCase):
         generate_notifications(today=fixed)
         notification.refresh_from_db()
         self.assertIsNotNone(notification.resolved_at)
+
+
+class GroupExcelExportTests(APITestCase):
+    def setUp(self):
+        self.cashier = User.objects.create_user(login='export-cashier', password='safe-password-123', full_name='Export Cashier', role='cashier')
+        self.other_cashier = User.objects.create_user(login='export-other', password='safe-password-123', full_name='Other Cashier', role='cashier')
+        self.group = Group.objects.create(name='Python export', subject='Python', technology='Python', schedule='Mon/Wed', total_lessons=24, created_by=self.cashier)
+        self.other_group = Group.objects.create(name='Flutter export', subject='Flutter', technology='Flutter', schedule='Tue/Thu', total_lessons=24, created_by=self.other_cashier)
+        self.student = Student.objects.create(full_name='Export Student', phone='+996700000001', course_price=Decimal('60000.00'), group=self.group, registered_by=self.cashier)
+        self.other_student = Student.objects.create(full_name='Hidden Student', course_price=Decimal('30000.00'), group=self.other_group, registered_by=self.other_cashier)
+        Transaction.objects.create(student=self.student, cashier=self.cashier, amount=Decimal('10000.00'), type='topup')
+        Transaction.objects.create(student=self.other_student, cashier=self.other_cashier, amount=Decimal('5000.00'), type='topup')
+
+    def test_cashier_export_contains_only_visible_confirmed_crm_data(self):
+        self.client.force_authenticate(self.cashier)
+
+        response = self.client.get(reverse('group-export'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        workbook = load_workbook(BytesIO(response.content), data_only=True)
+        try:
+            self.assertEqual(workbook.sheetnames, ['Топтор', 'Окуучулар', 'Тастыкталган төлөмдөр'])
+            student_names = [row[1] for row in workbook['Окуучулар'].iter_rows(min_row=2, values_only=True)]
+            self.assertEqual(student_names, ['Export Student'])
+            payment_names = [row[1] for row in workbook['Тастыкталган төлөмдөр'].iter_rows(min_row=2, values_only=True)]
+            self.assertEqual(payment_names, ['Export Student'])
+        finally:
+            workbook.close()
+
+
+class EmptyHandoverTests(APITestCase):
+    def test_empty_business_data_and_synthetic_role_logins(self):
+        users = {}
+        for role in ('director', 'cashier', 'accountant'):
+            users[role] = User.objects.create_user(login=f'empty-{role}', password='safe-password-123', full_name=f'Empty {role}', role=role)
+            response = self.client.post(reverse('token_obtain_pair'), {'login': f'empty-{role}', 'password': 'safe-password-123'}, format='json')
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertTrue(response.data.get('access'))
+
+        for role in ('director', 'cashier', 'accountant'):
+            self.client.force_authenticate(users[role])
+            groups = self.client.get(reverse('group-list'))
+            self.assertEqual(groups.status_code, status.HTTP_200_OK)
+            self.assertEqual(groups.data['count'], 0)
+
+        self.client.force_authenticate(users['cashier'])
+        dashboard = self.client.get(reverse('cashier-dashboard'))
+        self.assertEqual(dashboard.status_code, status.HTTP_200_OK)
+        for field in ('balance', 'today_received', 'month_received', 'overdue_amount', 'upcoming_amount'):
+            self.assertEqual(Decimal(dashboard.data[field]), Decimal('0'))
+        self.assertEqual(dashboard.data['debt_students_count'], 0)
+
+        self.client.force_authenticate(users['director'])
+        analytics = self.client.get(reverse('analytics-summary'))
+        self.assertEqual(analytics.status_code, status.HTTP_200_OK)
+        for field in ('total_income', 'total_expense', 'net_profit'):
+            self.assertEqual(Decimal(analytics.data[field]), Decimal('0'))
+
+        self.client.force_authenticate(users['accountant'])
+        expenses = self.client.get(reverse('expense-list'))
+        self.assertEqual(expenses.status_code, status.HTTP_200_OK)
+        self.assertEqual(expenses.data['count'], 0)
+
+    def test_cashier_with_no_groups_gets_empty_workbook_with_headers(self):
+        empty_cashier = User.objects.create_user(login='export-empty', password='safe-password-123', full_name='Empty Cashier', role='cashier')
+        self.client.force_authenticate(empty_cashier)
+        response = self.client.get(reverse('group-export'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        workbook = load_workbook(BytesIO(response.content), data_only=True)
+        try:
+            self.assertEqual(workbook.sheetnames, ['Топтор', 'Окуучулар', 'Тастыкталган төлөмдөр'])
+            for sheet in workbook:
+                self.assertEqual(sheet.max_row, 1)
+                self.assertTrue(all(cell.value for cell in sheet[1]))
+        finally:
+            workbook.close()
